@@ -127,12 +127,12 @@ class WebSocketHandler(tornado.web.RequestHandler):
     to accept it before the websocket connection will succeed.
     """
     def __init__(self, application, request, **kwargs):
-        super(WebSocketHandler, self).__init__(application, request, **kwargs)
         self.ws_connection = None
         self.close_code = None
         self.close_reason = None
         self.stream = None
         self._on_close_called = False
+        super(WebSocketHandler, self).__init__(application, request, **kwargs)
 
     @tornado.web.asynchronous
     def get(self, *args, **kwargs):
@@ -179,18 +179,13 @@ class WebSocketHandler(tornado.web.RequestHandler):
             gen_log.debug(log_msg)
             return
 
-        self.stream = self.request.connection.detach()
-        self.stream.set_close_callback(self.on_connection_close)
-
         self.ws_connection = self.get_websocket_protocol()
         if self.ws_connection:
             self.ws_connection.accept_connection()
         else:
-            if not self.stream.closed():
-                self.stream.write(tornado.escape.utf8(
-                    "HTTP/1.1 426 Upgrade Required\r\n"
-                    "Sec-WebSocket-Version: 7, 8, 13\r\n\r\n"))
-                self.stream.close()
+            self.set_status(426)
+            self.set_header("Set-WebSocket-Version", "7, 8, 13")
+            self.finish()
 
     def write_message(self, message, binary=False):
         """Sends the given message to the client of this Web Socket.
@@ -402,6 +397,10 @@ class WebSocketHandler(tornado.web.RequestHandler):
             return WebSocketProtocol13(
                 self, compression_options=self.get_compression_options())
 
+    def _attach_stream(self):
+        self.stream = self.request.connection.detach()
+        self.stream.set_close_callback(self.on_connection_close)
+
 
 def _wrap_method(method):
     def _disallow_for_websocket(self, *args, **kwargs):
@@ -578,8 +577,7 @@ class WebSocketProtocol13(WebSocketProtocol):
             selected = self.handler.select_subprotocol(subprotocols)
             if selected:
                 assert selected in subprotocols
-                subprotocol_header = ("Sec-WebSocket-Protocol: %s\r\n"
-                                      % selected)
+                self.handler.set_header("Sec-WebSocket-Protocol", selected)
 
         extension_header = ''
         extensions = self._parse_extensions_header(self.request.headers)
@@ -594,23 +592,20 @@ class WebSocketProtocol13(WebSocketProtocol):
                     # Don't echo an offered client_max_window_bits
                     # parameter with no value.
                     del ext[1]['client_max_window_bits']
-                extension_header = ('Sec-WebSocket-Extensions: %s\r\n' %
-                                    httputil._encode_header(
-                                        'permessage-deflate', ext[1]))
+                self.handler.set_header("Sec-WebSocket-Extensions",
+                                        httputil._encode_header(
+                                            'permessage-deflate', ext[1]))
                 break
 
-        if self.stream.closed():
-            self._abort()
-            return
-        self.stream.write(tornado.escape.utf8(
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: %s\r\n"
-            "%s%s%s"
-            "\r\n" % (self._challenge_response(),
-                      subprotocol_header, extension_header,
-                      self.handler.upgrade_response_headers())))
+        self.handler.clear_header("Content-Type")
+        self.handler.set_status(101)
+        self.handler.set_header("Upgrade", "websocket")
+        self.handler.set_header("Connection", "Upgrade")
+        self.handler.set_header("Sec-WebSocket-Accept", self._challenge_response())
+        self.handler.finish()
+
+        self.handler._attach_stream()
+        self.stream = self.handler.stream
 
         self._run_callback(self.handler.open, *self.handler.open_args,
                            **self.handler.open_kwargs)
